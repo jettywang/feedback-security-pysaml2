@@ -7,6 +7,9 @@ from pymongo import MongoClient
 import pymongo.errors
 import pymongo.uri_parser
 
+from saml2.authn_strength import AuthnContextStrength
+from saml2.authn_strength import context_matches
+from saml2.authn_strength import explain_context_mismatch
 from saml2.eptid import Eptid
 from saml2.ident import IdentDB
 from saml2.ident import Unknown
@@ -32,17 +35,23 @@ class CorruptDatabase(Exception):
     pass
 
 
-def context_match(cfilter, cntx):
-    # TODO
-    return True
+def context_match(cfilter, cntx, strength=None):
+    """Check that an authentication context matches a request.
+
+    See :func:`saml2.sdb.context_match`.  Both session stores use the
+    same comparison implementation so cached sessions behave identically
+    regardless of the backing store.
+    """
+    return context_matches(cfilter, cntx, strength)
 
 
 class SessionStorageMDB:
     """Session information is stored in a MongoDB database"""
 
-    def __init__(self, database="", collection="assertion", **kwargs):
+    def __init__(self, database="", collection="assertion", authn_context_strength=None, **kwargs):
         db = _mdb_get_database(database, **kwargs)
         self.assertion = db[collection]
+        self.strength = AuthnContextStrength.from_config(authn_context_strength)
 
     def store_assertion(self, assertion, to_sign):
         name_id = assertion.subject.name_id
@@ -68,32 +77,32 @@ class SessionStorageMDB:
         else:
             raise SystemError("More then one assertion with the same ID")
 
-    def get_assertions_by_subject(self, name_id=None, session_index=None, requested_context=None):
-        """
-
-        :param name_id: One of name_id or key can be used to get the authn
-            statement
-        :param session_index: If match against a session index should be done
-        :param requested_context: Authn statements should match a specific
-            authn context
-        :return:
-        """
-        result = []
+    def _find_assertions(self, name_id):
         key = sha1(code_binary(name_id)).hexdigest()
         for item in self.assertion.find({"name_id_key": key}):
-            assertion = from_dict(item["assertion"], ONTS, True)
-            if session_index or requested_context:
-                for statement in assertion.authn_statement:
-                    if session_index:
-                        if statement.session_index == session_index:
-                            result.append(assertion)
-                            break
-                    if requested_context:
-                        if context_match(requested_context, statement.authn_context):
-                            result.append(assertion)
-                            break
-            else:
+            yield from_dict(item["assertion"], ONTS, True)
+
+    def get_assertions_by_subject(self, name_id=None, session_index=None, requested_context=None):
+        """Return assertions that satisfy the session and context filters.
+
+        The same matching rules are used as in the in-memory store, so a
+        cached session that does not meet a stronger authentication
+        context request is not returned merely because it existed before.
+        """
+        result = []
+        for assertion in self._find_assertions(name_id):
+            if not session_index and not requested_context:
                 result.append(assertion)
+                continue
+            for statement in assertion.authn_statement:
+                if session_index and statement.session_index != session_index:
+                    continue
+                if requested_context and not context_match(
+                    requested_context, statement.authn_context, self.strength
+                ):
+                    continue
+                result.append(assertion)
+                break
         return result
 
     def remove_authn_statements(self, name_id):
@@ -110,6 +119,33 @@ class SessionStorageMDB:
         :return:
         """
         return [k.authn_statement for k in self.get_assertions_by_subject(name_id, session_index, requested_context)]
+
+    def explain_authn_statements(self, name_id, session_index=None, requested_context=None):
+        """Explain why stored statements are or are not reusable.
+
+        Returns a list of ``(session_index, context, accepted, reason)``
+        tuples; the reason is empty when the statement can be reused.
+        """
+        explanations = []
+        for assertion in self._find_assertions(name_id):
+            for statement in assertion.authn_statement:
+                if session_index and statement.session_index != session_index:
+                    accepted = False
+                    reason = (
+                        f"stored session index {statement.session_index!r} does not match {session_index!r}"
+                    )
+                elif requested_context and not context_match(
+                    requested_context, statement.authn_context, self.strength
+                ):
+                    accepted = False
+                    reason = explain_context_mismatch(
+                        requested_context, statement.authn_context, self.strength
+                    )
+                else:
+                    accepted = True
+                    reason = ""
+                explanations.append((statement.session_index, statement.authn_context, accepted, reason))
+        return explanations
 
 
 class IdentMDB(IdentDB):

@@ -22,6 +22,8 @@ from saml2 import SAMLError
 from saml2 import saml
 from saml2 import samlp
 from saml2 import soap
+from saml2.authn_strength import context_matches
+from saml2.authn_strength import explain_context_mismatch
 from saml2.entity import Entity
 from saml2.extension import sp_type
 from saml2.extension.requested_attributes import RequestedAttribute
@@ -40,9 +42,10 @@ from saml2.response import StatusError
 from saml2.s_utils import UnravelError
 from saml2.s_utils import do_attributes
 from saml2.s_utils import signature
+from saml2.saml import AuthnContext
+from saml2.saml import AuthnContextClassRef
 from saml2.saml import NAMEID_FORMAT_PERSISTENT
 from saml2.saml import NAMEID_FORMAT_TRANSIENT
-from saml2.saml import AuthnContextClassRef
 from saml2.samlp import AttributeQuery
 from saml2.samlp import AuthnQuery
 from saml2.samlp import AuthnRequest
@@ -265,6 +268,44 @@ class Base(Entity):
     def is_session_valid(_session_id):
         """Place holder. Supposed to check if the session is still valid."""
         return True
+
+    def cached_session_satisfies(self, name_id, entity_id, requested_authn_context):
+        """Check cached authentication information against a new request.
+
+        The SP cache stores the ``authn_info`` reported by the IdP.  When a
+        strength partial order is configured this method re-checks it, so
+        an existing login cannot be reused for a stronger request merely
+        because it was accepted for an earlier one.
+
+        :return: ``(accepted, reason)``; reason is empty when accepted.
+        """
+        strength = self.config.get_authn_context_strength("sp")
+        if strength is None:
+            return True, ""
+        try:
+            session_info = self.users.get_info_from(name_id, entity_id, False)
+        except (KeyError, ValueError):
+            return False, "no cached authentication information"
+        authn_info = session_info.get("authn_info") or []
+        if not authn_info:
+            return False, "cached authentication information has no authentication context"
+        first_context = None
+        for entry in authn_info:
+            context = entry[0] if isinstance(entry, (list, tuple)) else entry
+            if not context:
+                continue
+            if first_context is None:
+                first_context = context
+            provided = AuthnContext(authn_context_class_ref=AuthnContextClassRef(text=context))
+            if context_matches(requested_authn_context, provided, strength):
+                return True, ""
+        if first_context is None:
+            return False, "cached authentication information has no authentication context"
+        return False, explain_context_mismatch(
+            requested_authn_context,
+            AuthnContext(authn_context_class_ref=AuthnContextClassRef(text=first_context)),
+            strength,
+        )
 
     def service_urls(self, binding=BINDING_HTTP_POST):
         _res = self.config.endpoint("assertion_consumer_service", binding, "sp")

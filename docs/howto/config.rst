@@ -878,6 +878,37 @@ Example::
 
     "session_storage": ("mongodb", "session")
 
+authn_context_strength
+""""""""""""""""""""""
+
+An optional partial order over authentication context class references.
+Both the SP and the IdP can use it. The value maps a class reference to
+the class references that are strictly stronger than it::
+
+    "authn_context_strength": {
+        "urn:example:password": [
+            "urn:example:sms",
+            "urn:example:client-certificate",
+        ],
+        "urn:example:sms": ["urn:example:mfa"],
+        "urn:example:client-certificate": ["urn:example:mfa"],
+    }
+
+The relation is transitive; only the direct edges need to be listed. The
+example is a diamond: ``sms`` and ``client-certificate`` are both stronger
+than ``password`` and weaker than ``mfa``, but they are incomparable with
+each other. Incomparable contexts never substitute for one another.
+
+When this option is set, ``exact``, ``minimum``, ``maximum`` and ``better``
+in ``<RequestedAuthnContext>`` all use this relation, both when an IdP
+selects an authentication method and when it decides whether an existing
+session can be reused. A cycle in the configuration is rejected when the
+configuration is loaded. Without this option pysaml2 keeps its historical
+integer ``level`` behaviour.
+
+The optional ``authn_context_strength`` argument of ``AuthnBroker`` accepts
+the same value for applications that build authentication brokers directly.
+
 domain
 """"""
 

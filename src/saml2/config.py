@@ -16,6 +16,7 @@ from saml2 import BINDING_URI
 from saml2 import SAMLError
 from saml2.assertion import Policy
 from saml2.attribute_converter import ac_factory
+from saml2.authn_strength import AuthnContextStrength
 from saml2.mdstore import MetadataStore
 from saml2.saml import NAME_FORMAT_URI
 from saml2.virtual_org import VirtualOrg
@@ -76,6 +77,7 @@ COMMON_ARGS = [
     "signing_algorithm",
     "digest_algorithm",
     "http_client_timeout",
+    "authn_context_strength",
 ]
 
 SP_ARGS = [
@@ -230,6 +232,7 @@ class Config:
         self.signing_algorithm = None
         self.digest_algorithm = None
         self.http_client_timeout = None
+        self.authn_context_strength = None
 
     def setattr(self, context, attr, val):
         if context == "":
@@ -246,6 +249,21 @@ class Config:
         else:
             return getattr(self, f"_{context}_{attr}", None)
 
+    def get_authn_context_strength(self, context=None):
+        """Return the configured partial order for a service, if any.
+
+        A service specific configuration takes precedence over the global
+        one.  The value is validated on load; passing an already built
+        :class:`~saml2.authn_strength.AuthnContextStrength` through is
+        also accepted.
+        """
+        configured = self.getattr("authn_context_strength", context)
+        if configured is None and context not in (None, ""):
+            configured = self.getattr("authn_context_strength", "")
+        if configured is None:
+            return None
+        return AuthnContextStrength.from_config(configured)
+
     def load_special(self, cnf, typ):
         for arg in SPEC[typ]:
             try:
@@ -257,6 +275,9 @@ class Config:
                     _val = True
                 elif _val == "false":
                     _val = False
+                if arg == "authn_context_strength" and _val is not None:
+                    # Validate the partial order before it can be used.
+                    _val = AuthnContextStrength.from_config(_val)
                 self.setattr(typ, arg, _val)
 
         self.context = typ
@@ -334,6 +355,11 @@ class Config:
 
         if "extensions" in cnf:
             self.do_extensions(cnf["extensions"])
+
+        if self.authn_context_strength is not None:
+            # Reject malformed or cyclic orders before the server can start
+            # and before any authentication decision is made with them.
+            self.authn_context_strength = AuthnContextStrength.from_config(self.authn_context_strength)
 
         self.load_complex(cnf)
         self.context = self.def_context

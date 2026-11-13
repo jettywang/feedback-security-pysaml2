@@ -73,12 +73,16 @@ class Server(Entity):
         stype="idp",
         symkey="",
         msg_cb=None,
+        authn_context_strength=None,
     ):
         Entity.__init__(self, stype, config, config_file, msg_cb=msg_cb)
         self.eptid = None
         self.init_config(stype)
         self.cache = cache
         self.ticket = {}
+        if authn_context_strength is None:
+            authn_context_strength = self.config.get_authn_context_strength("idp")
+        self.authn_context_strength = authn_context_strength
         self.session_db = self.choose_session_storage()
         if symkey:
             self.symkey = symkey.encode()
@@ -100,17 +104,18 @@ class Server(Entity):
 
     def choose_session_storage(self):
         _spec = self.config.getattr("session_storage", "idp")
+        strength = self.authn_context_strength
         if not _spec:
-            return SessionStorage()
+            return SessionStorage(authn_context_strength=strength)
         elif isinstance(_spec, str):
             if _spec.lower() == "memory":
-                return SessionStorage()
+                return SessionStorage(authn_context_strength=strength)
         else:  # Should be tuple
             typ, data = _spec
             if typ.lower() == "mongodb":
                 from saml2.mongo_store import SessionStorageMDB
 
-                return SessionStorageMDB(database=data, collection="session")
+                return SessionStorageMDB(database=data, collection="session", authn_context_strength=strength)
 
         raise NotImplementedError("No such storage type implemented")
 
@@ -1024,6 +1029,25 @@ class Server(Entity):
             digest_alg=digest_alg,
             **args,
         )
+
+    def explain_authn_statements(self, subject, session_index=None, requested_context=None):
+        """Explain why stored sessions can or cannot satisfy an AuthnQuery.
+
+        Session reuse must apply the same authentication strength rules as
+        the initial redirect.  This method returns the per-statement
+        decision and reason from the configured session store, so an
+        existing login that does not meet a stronger (for example MFA)
+        request can be reported precisely instead of silently reused.
+
+        :param subject: The subject whose assertions should be inspected
+        :param session_index: Optional session index that must match
+        :param requested_context: Optional ``RequestedAuthnContext``
+        :return: list of ``(session_index, context, accepted, reason)``
+        """
+        explain = getattr(self.session_db, "explain_authn_statements", None)
+        if explain is None:
+            return []
+        return explain(subject.name_id, session_index, requested_context)
 
     # ---------
 
