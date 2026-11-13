@@ -1604,7 +1604,7 @@ class SecurityContext:
         return self.correctly_signed_message(decoded_xml, "name_id_mapping_response", must, origdoc, only_valid_cert)
 
     def correctly_signed_artifact_request(self, decoded_xml, must=False, origdoc=None, only_valid_cert=False, **kwargs):
-        return self.correctly_signed_message(decoded_xml, "artifact_request", must, origdoc, only_valid_cert)
+        return self.correctly_signed_message(decoded_xml, "artifact_resolve", must, origdoc, only_valid_cert)
 
     def correctly_signed_artifact_response(
         self, decoded_xml, must=False, origdoc=None, only_valid_cert=False, **kwargs

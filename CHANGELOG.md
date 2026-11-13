@@ -1,6 +1,22 @@
 # Changelog
 
 
+## Unreleased
+
+- Harden the HTTP Artifact binding: issued artifacts are now stored with the
+  bound recipient entity ID, SourceID and endpoint index, and are only
+  released to a signed ArtifactResolve from that recipient
+- ArtifactResolve messages are required to be signed by default
+  (`want_artifact_resolves_signed`) with optional certificate validation
+  (`want_artifact_resolves_only_with_valid_cert`)
+- Artifact resolution gains an explicit retry contract for lost responses,
+  configurable `artifact_ttl` expiry, and externally identical handling of
+  unknown versus expired artifacts while keeping the causes distinct
+  internally
+- Fix `SecurityContext.correctly_signed_artifact_request` to verify the
+  `artifact_resolve` message type
+
+
 ## v7.5.5 (2026-09-17)
 
 - Resolve CVE-2026-26007 by migrating to the from pyOpenSSL to the cryptography APIs

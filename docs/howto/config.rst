@@ -538,6 +538,14 @@ difference in seconds you are prepared to accept.
 .. note:: This will indiscriminately affect all time comparisons.
     Hence your server may accept a statement that in fact is too old.
 
+artifact_ttl
+^^^^^^^^^^^^
+
+Lifetime in seconds of an artifact issued through the HTTP Artifact binding.
+After this time the stored message can no longer be resolved; expired and
+unknown artifacts return the same generic error to the caller. Defaults to
+300 seconds.
+
 allow_unknown_attributes
 ^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -718,6 +726,20 @@ want_authn_requests_only_with_valid_cert
 
 When verifying a signed AuthnRequest ignore the signature and verify the
 certificate.
+
+want_artifact_resolves_signed
+""""""""""""""""""""""""""""""
+
+Indicates that an ArtifactResolve received on the artifact resolution
+service must be signed with a certificate known from the issuer's metadata.
+Can be ``True`` or ``False``. ArtifactResolve messages are required to be
+signed by default; set this to ``False`` only for legacy deployments.
+
+want_artifact_resolves_only_with_valid_cert
+"""""""""""""""""""""""""""""""""""""""""""
+
+When verifying a signed ArtifactResolve, additionally require the signing
+certificate to validate. Implies ``want_artifact_resolves_signed``.
 
 policy
 """"""

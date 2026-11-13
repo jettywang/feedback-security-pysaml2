@@ -51,6 +51,7 @@ COMMON_ARGS = [
     "disable_ssl_certificate_validation",
     "preferred_binding",
     "session_storage",
+    "artifact_ttl",
     "assurance_certification",
     "entity_attributes",
     "entity_category",
@@ -103,6 +104,8 @@ SP_ARGS = [
     "sp_type_in_metadata",
     "requested_attributes",
     "requested_authn_context",
+    "want_artifact_resolves_signed",
+    "want_artifact_resolves_only_with_valid_cert",
 ]
 
 AA_IDP_ARGS = [
@@ -113,6 +116,8 @@ AA_IDP_ARGS = [
     "encrypt_assertion_self_contained",
     "want_authn_requests_signed",
     "want_authn_requests_only_with_valid_cert",
+    "want_artifact_resolves_signed",
+    "want_artifact_resolves_only_with_valid_cert",
     "provided_attributes",
     "subject_data",
     "sp",
@@ -197,6 +202,9 @@ class Config:
         self.logout_requests_signed = None
         self.logout_responses_signed = None
         self.disable_ssl_certificate_validation = None
+        self.artifact_ttl = None
+        self.want_artifact_resolves_signed = None
+        self.want_artifact_resolves_only_with_valid_cert = None
         self.context = ""
         self.attribute_converters = None
         self.metadata = None

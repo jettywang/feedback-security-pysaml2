@@ -81,7 +81,7 @@ def test_create_artifact_resolve():
 
         destination = idp.artifact2destination(b64art, "spsso")
 
-        msg_id, msg = idp.create_artifact_resolve(b64art, destination, sid())
+        msg_id, msg = idp.create_artifact_resolve(b64art, destination, sid(), sign=True)
 
         print(msg)
 
@@ -107,7 +107,7 @@ def test_artifact_flow():
         relay_state = "RS0"
         req_id, req = sp.create_authn_request(destination, id="id1")
 
-        artifact = sp.use_artifact(req, 1)
+        artifact = sp.use_artifact(req, 1, recipient_entity_id=idp.config.entityid)
 
         binding, destination = sp.pick_binding(
             "single_sign_on_service", [BINDING_HTTP_ARTIFACT], entity_id=idp.config.entityid
@@ -125,7 +125,7 @@ def test_artifact_flow():
 
         destination = idp.artifact2destination(artifact2, "spsso")
 
-        msg_id, msg = idp.create_artifact_resolve(artifact2, destination, sid())
+        msg_id, msg = idp.create_artifact_resolve(artifact2, destination, sid(), sign=True)
 
         hinfo = idp.use_soap(msg, destination, None, False)
 
@@ -183,7 +183,7 @@ def test_artifact_flow():
 
         # with the response in hand create an artifact
 
-        artifact = idp.use_artifact(response, 1)
+        artifact = idp.use_artifact(response, 1, recipient_entity_id=sp.config.entityid)
 
         binding, destination = sp.pick_binding(
             "single_sign_on_service", [BINDING_HTTP_ARTIFACT], entity_id=idp.config.entityid
@@ -200,7 +200,7 @@ def test_artifact_flow():
         destination = sp.artifact2destination(artifact3, "idpsso")
 
         # Got an artifact want to replace it with the real message
-        msg_id, msg = sp.create_artifact_resolve(artifact3, destination, sid())
+        msg_id, msg = sp.create_artifact_resolve(artifact3, destination, sid(), sign=True)
 
         print(msg)
 

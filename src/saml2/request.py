@@ -278,6 +278,14 @@ class ManageNameIDRequest(Request):
         self.signature_check = self.sec.correctly_signed_manage_name_id_request
 
 
+class ArtifactResolveRequest(Request):
+    msgtype = "artifact_resolve"
+
+    def __init__(self, sec_context, receiver_addrs, attribute_converters=None, timeslack=0):
+        Request.__init__(self, sec_context, receiver_addrs, attribute_converters, timeslack)
+        self.signature_check = self.sec.correctly_signed_artifact_request
+
+
 SERVICE2REQUEST = {
     "single_sign_on_service": AuthnRequest,
     "attribute_service": AttributeQuery,
@@ -286,6 +294,6 @@ SERVICE2REQUEST = {
     "authn_query_service": AuthnQuery,
     "manage_name_id_service": ManageNameIDRequest,
     "name_id_mapping_service": NameIDMappingRequest,
-    # "artifact_resolve_service": ArtifactResolve,
+    "artifact_resolve_service": ArtifactResolveRequest,
     "single_logout_service": LogoutRequest,
 }

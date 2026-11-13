@@ -1,7 +1,5 @@
 import base64
-from binascii import hexlify
 import copy
-from hashlib import sha1
 import logging
 import zlib
 
@@ -24,6 +22,15 @@ from saml2 import response as saml_response
 from saml2 import saml
 from saml2 import samlp
 from saml2 import soap
+from saml2.artifact import ARTIFACT_TYPECODE
+from saml2.artifact import DEFAULT_ARTIFACT_TTL
+from saml2.artifact import ArtifactResolutionDenied
+from saml2.artifact import ArtifactStore
+from saml2.artifact import ExpiredArtifact
+from saml2.artifact import UnknownArtifact
+from saml2.artifact import create_artifact
+from saml2.artifact import decode_artifact
+from saml2.artifact import new_message_handle
 from saml2.config import config_factory
 from saml2.httpbase import HTTPBase
 from saml2.mdstore import all_locations
@@ -39,7 +46,6 @@ from saml2.s_utils import UnravelError
 from saml2.s_utils import UnsupportedBinding
 from saml2.s_utils import decode_base64_and_inflate
 from saml2.s_utils import error_status_factory
-from saml2.s_utils import rndbytes
 from saml2.s_utils import sid
 from saml2.s_utils import success_status_factory
 from saml2.saml import NAMEID_FORMAT_ENTITY
@@ -58,7 +64,6 @@ from saml2.samlp import LogoutRequest
 from saml2.samlp import ManageNameIDRequest
 from saml2.samlp import NameIDMappingRequest
 from saml2.samlp import SessionIndex
-from saml2.samlp import artifact_resolve_from_string
 from saml2.samlp import response_from_string
 from saml2.sigver import SignatureError
 from saml2.sigver import SigverError
@@ -83,8 +88,6 @@ logger = logging.getLogger(__name__)
 
 __author__ = "rolandh"
 
-ARTIFACT_TYPECODE = b"\x00\x04"
-
 SERVICE2MESSAGE = {
     "single_sign_on_service": AuthnRequest,
     "attribute_service": AttributeQuery,
@@ -100,31 +103,6 @@ SERVICE2MESSAGE = {
 
 class UnknownBinding(SAMLError):
     pass
-
-
-def create_artifact(entity_id, message_handle, endpoint_index=0):
-    """
-    SAML_artifact   := B64(TypeCode EndpointIndex RemainingArtifact)
-    TypeCode        := Byte1Byte2
-    EndpointIndex   := Byte1Byte2
-
-    RemainingArtifact := SourceID MessageHandle
-    SourceID          := 20-byte_sequence
-    MessageHandle     := 20-byte_sequence
-
-    :param entity_id:
-    :param message_handle:
-    :param endpoint_index:
-    :return:
-    """
-    if not isinstance(entity_id, bytes):
-        entity_id = entity_id.encode("utf-8")
-    sourceid = sha1(entity_id)
-
-    if not isinstance(message_handle, bytes):
-        message_handle = message_handle.encode("utf-8")
-    ter = b"".join((ARTIFACT_TYPECODE, (f"{endpoint_index:02x}").encode("ascii"), sourceid.digest(), message_handle))
-    return base64.b64encode(ter).decode("ascii")
 
 
 class Entity(HTTPBase):
@@ -189,7 +167,8 @@ class Entity(HTTPBase):
         else:
             self.vorg = None
 
-        self.artifact = {}
+        ttl = self.config.getattr("artifact_ttl") or DEFAULT_ARTIFACT_TTL
+        self.artifact = ArtifactStore(ttl=ttl)
         if self.metadata:
             self.sourceid = self.metadata.construct_source_id()
         else:
@@ -1252,11 +1231,53 @@ class Entity(HTTPBase):
         digest_alg=None,
     ):
         """
-        Create an ArtifactResponse
-        :return:
+        Create an ArtifactResponse.
+
+        The artifact is only released when the authenticated issuer of the
+        ArtifactResolve is the entity the artifact was originally bound to.
+        Unknown and expired artifacts are both reported through a generic
+        Requester error status so an outside caller cannot tell them apart.
+
+        :return: An ArtifactResponse containing the stored SAML message, or
+            an error ArtifactResponse if the artifact cannot be returned.
         """
 
         rinfo = self.response_args(request, bindings)
+        requester = request.issuer.text.strip()
+
+        try:
+            message = self.artifact.resolve(artifact, requester)
+        except ArtifactResolutionDenied as exc:
+            logger.warning("Artifact resolution denied: %s", exc)
+            return self._artifact_error_response(
+                request,
+                (samlp.STATUS_REQUEST_DENIED, "Permission denied for the requested artifact"),
+                sign=sign,
+                issuer=issuer,
+                sign_alg=sign_alg,
+                digest_alg=digest_alg,
+            )
+        except ExpiredArtifact:
+            logger.info("Artifact %s has expired", artifact)
+            return self._artifact_error_response(
+                request,
+                (samlp.STATUS_REQUESTER, "The artifact could not be resolved"),
+                sign=sign,
+                issuer=issuer,
+                sign_alg=sign_alg,
+                digest_alg=digest_alg,
+            )
+        except UnknownArtifact:
+            logger.info("Unknown artifact %s", artifact)
+            return self._artifact_error_response(
+                request,
+                (samlp.STATUS_REQUESTER, "The artifact could not be resolved"),
+                sign=sign,
+                issuer=issuer,
+                sign_alg=sign_alg,
+                digest_alg=digest_alg,
+            )
+
         response = self._status_response(
             ArtifactResponse,
             issuer,
@@ -1267,12 +1288,26 @@ class Entity(HTTPBase):
             **rinfo,
         )
 
-        msg = element_to_extension_element(self.artifact[artifact])
+        msg = element_to_extension_element(message)
         response.extension_elements = [msg]
 
         logger.debug("Response: %s", response)
 
         return response
+
+    def _artifact_error_response(self, request, info, sign=None, issuer=None, sign_alg=None, digest_alg=None):
+        """Build an ArtifactResponse carrying an error status."""
+        rinfo = self.response_args(request, None)
+        status = error_status_factory(info)
+        return self._status_response(
+            ArtifactResponse,
+            issuer,
+            status,
+            sign=sign,
+            sign_alg=sign_alg,
+            digest_alg=digest_alg,
+            **rinfo,
+        )
 
     # XXX DONE ent create > _message
     def create_manage_name_id_request(
@@ -1557,44 +1592,80 @@ class Entity(HTTPBase):
             signature=signature,
         )
 
-    def use_artifact(self, message, endpoint_index=0):
-        """
+    def use_artifact(self, message, endpoint_index=0, recipient_entity_id=None):
+        """Mint an artifact for a message and persist the binding.
 
-        :param message:
-        :param endpoint_index:
-        :return:
+        The stored record binds the message to the entity that is allowed to
+        resolve it (the SP the browser is redirected to), together with the
+        SourceID of this entity and the artifact resolution endpoint index.
+
+        :param message: The full SAML message the artifact stands for.
+        :param endpoint_index: Index of this entity's Artifact Resolution
+            Service endpoint, embedded in the artifact.
+        :param recipient_entity_id: Entity ID allowed to resolve the
+            artifact. Defaults to this entity's own ID for backward
+            compatibility; new deployments should always pass the remote
+            SP/IdP entity ID explicitly.
+        :return: The Base64 encoded SAML artifact.
         """
-        message_handle = sha1(str(message).encode("utf-8"))
-        message_handle.update(rndbytes())
-        mhd = message_handle.digest()
-        saml_art = create_artifact(self.config.entityid, mhd, endpoint_index)
-        self.artifact[saml_art] = message
+        if recipient_entity_id is None:
+            recipient_entity_id = self.config.entityid
+
+        message_handle = new_message_handle()
+        saml_art = create_artifact(self.config.entityid, message_handle, endpoint_index)
+
+        _typecode, art_index, source_id, _handle = decode_artifact(saml_art)
+        self.artifact.issue(
+            artifact=saml_art,
+            message=message,
+            recipient_entity_id=recipient_entity_id,
+            source_id=source_id,
+            endpoint_index=art_index,
+        )
         return saml_art
+
+    def artifact_info(self, artifact):
+        """Return the binding metadata embedded in an artifact.
+
+        :param artifact: The Base64 encoded SAML artifact.
+        :return: A dict with keys ``typecode``, ``endpoint_index``,
+            ``source_id`` and ``message_handle``.
+        :raises InvalidArtifact: if the artifact is malformed.
+        """
+        typecode, endpoint_index, source_id, message_handle = decode_artifact(artifact)
+        return {
+            "typecode": typecode,
+            "endpoint_index": endpoint_index,
+            "source_id": source_id,
+            "message_handle": message_handle,
+        }
 
     def artifact2destination(self, artifact, descriptor):
         """
-        Translate an artifact into a receiver location
+        Translate an artifact into a receiver location.
+
+        The SourceID identifies the issuer and the endpoint index selects
+        one of that issuer's Artifact Resolution Service endpoints.
 
         :param artifact: The Base64 encoded SAML artifact
-        :return:
+        :param descriptor: The descriptor family to look up ("spsso" or
+            "idpsso").
+        :return: The endpoint location URL or ``None`` if no endpoint
+            matches the embedded index.
+        :raises InvalidArtifact: if the artifact is malformed.
         """
-
-        _art = base64.b64decode(artifact)
-
-        typecode = _art[:2]
-        if typecode != ARTIFACT_TYPECODE:
-            raise ValueError(f"Invalid artifact typecode {repr(typecode)} should be {repr(ARTIFACT_TYPECODE)}")
+        _typecode, endpoint_index, source_id, _handle = decode_artifact(artifact)
 
         try:
-            endpoint_index = str(int(_art[2:4]))
-        except ValueError:
-            endpoint_index = str(int(hexlify(_art[2:4])))
-        entity = self.sourceid[_art[4:24]]
+            entity = self.sourceid[source_id]
+        except KeyError as exc:
+            raise UnknownArtifact(f"No known entity for SourceID of artifact {artifact!r}") from exc
 
+        wanted_index = str(endpoint_index)
         destination = None
         for desc in entity[f"{descriptor}_descriptor"]:
             for srv in desc["artifact_resolution_service"]:
-                if srv["index"] == endpoint_index:
+                if srv["index"] == wanted_index:
                     destination = srv["location"]
                     break
 
@@ -1633,17 +1704,63 @@ class Entity(HTTPBase):
         )
         return self.send_using_soap(msg, destination)
 
-    def parse_artifact_resolve(self, txt, **kwargs):
-        """
-        Always done over SOAP
+    def parse_artifact_resolve(self, txt, binding=BINDING_SOAP, must_sign=None, only_valid_cert=None, **kwargs):
+        """Parse and authenticate a SOAP enveloped ArtifactResolve.
 
-        :param txt: The SOAP enveloped ArtifactResolve
-        :param kwargs:
-        :return: An ArtifactResolve instance
+        The message signature is verified against the metadata certs of its
+        issuer. By default a valid signature is required; unsigned or badly
+        signed requests raise before any artifact can be touched, so an
+        unauthenticated caller can never consume a reference.
+
+        :param txt: The SOAP enveloped ArtifactResolve.
+        :param binding: The transport binding; artifact resolution always
+            uses SOAP but the parameter is kept for API compatibility.
+        :param must_sign: Require a valid signature. Defaults to the
+            ``want_artifact_resolves_signed`` configuration flag, or True.
+        :param only_valid_cert: Require the signing certificate to validate
+            in addition to the signature. Defaults to the
+            ``want_artifact_resolves_only_with_valid_cert`` flag.
+        :return: An authenticated ArtifactResolve instance.
         """
+        if must_sign is None:
+            configured = self.config.getattr("want_artifact_resolves_signed")
+            must_sign = True if configured is None else configured
+        if only_valid_cert is None:
+            only_valid_cert = self.config.getattr("want_artifact_resolves_only_with_valid_cert") or False
+        if only_valid_cert:
+            must_sign = True
 
         _resp = parse_soap_enveloped_saml_artifact_resolve(txt)
-        return artifact_resolve_from_string(_resp)
+        request = saml_request.ArtifactResolveRequest(
+            self.sec,
+            self.config.endpoint("artifact_resolution_service", BINDING_SOAP, self.entity_type),
+            self.config.attribute_converters,
+            timeslack=self.config.accepted_time_diff or 0,
+        )
+        request.loads(
+            _resp,
+            binding if binding is not None else BINDING_SOAP,
+            origdoc=txt,
+            must=must_sign,
+            only_valid_cert=only_valid_cert,
+        )
+        request.verify()
+        return request.message
+
+    def handle_artifact_resolve(self, txt, binding=BINDING_SOAP, sign_response=None, **kwargs):
+        """Full server side handling of an ArtifactResolve request.
+
+        Authentication happens first: only after the signature has been
+        verified does the artifact store get consulted, and only the entity
+        the artifact is bound to receives the embedded message.
+
+        :param txt: The SOAP enveloped ArtifactResolve.
+        :param binding: The transport binding, kept for API compatibility.
+        :param sign_response: Whether the ArtifactResponse should be signed.
+        :return: An ArtifactResponse instance (success or error status).
+        """
+        request = self.parse_artifact_resolve(txt, binding=binding, **kwargs)
+        return self.create_artifact_response(request, request.artifact.text, sign=sign_response)
 
     def parse_artifact_resolve_response(self, xmlstr):
         kwargs = {"entity_id": self.config.entityid, "attribute_converters": self.config.attribute_converters}
