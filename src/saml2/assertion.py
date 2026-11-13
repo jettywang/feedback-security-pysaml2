@@ -10,6 +10,7 @@ from saml2 import xmlenc
 from saml2.attribute_converter import ac_factory
 from saml2.attribute_converter import from_local
 from saml2.attribute_converter import get_local_name
+from saml2.attribute_policy import AttributeReleasePolicy
 from saml2.s_utils import MissingValue
 from saml2.s_utils import assertion_factory
 from saml2.s_utils import factory
@@ -488,6 +489,51 @@ class Policy:
 
         return in_a_while(**self.get_lifetime(sp_entity_id))
 
+    def decide(self, ava, sp_entity_id, mdstore=None, required=None, optional=None):
+        """Return an explainable :class:`AttributeReleaseDecision`.
+
+        Unlike :meth:`filter` this never raises for an unfulfilled requirement
+        and never leaks filtered values: the decision only records the names of
+        released/filtered attributes, the reason codes and value counts.
+
+        :param ava: The information about the subject as a dictionary
+        :param sp_entity_id: The entity ID of the SP
+        :param required: Attributes that the SP requires
+        :param optional: Attributes that the SP regards as optional
+        :return: An :class:`~saml2.attribute_policy.AttributeReleaseDecision`
+        """
+        if mdstore is not None:
+            warn_msg = (
+                "The mdstore parameter for saml2.assertion.Policy.decide "
+                "is deprecated; "
+                "instead, initialize the Policy object setting the mds param."
+            )
+            logger.warning(warn_msg)
+            _warn(warn_msg, DeprecationWarning)
+
+        if not self.acs:
+            self.acs = ac_factory()
+
+        engine = AttributeReleasePolicy(self.acs, self.get_fail_on_missing_requested(sp_entity_id))
+
+        entity_allowlist = self.get_entity_categories(sp_entity_id, mds=mdstore, required=required)
+        category_gate = bool(entity_allowlist)
+        attribute_restrictions = self.get_attribute_restrictions(sp_entity_id)
+
+        return engine.decide(
+            ava,
+            sp_entity_id,
+            required=required,
+            optional=optional,
+            # An empty dict means "no categories active"; only pass an allow-list
+            # (even an empty one) when the category mechanism produced a result.
+            # The "" key is an internal sentinel and must never be an attribute.
+            entity_category_allowlist=(
+                [name for name in entity_allowlist if name] if category_gate else None
+            ),
+            attribute_restrictions=attribute_restrictions,
+        )
+
     def filter(self, ava, sp_entity_id, mdstore=None, required=None, optional=None):
         """What attribute and attribute values returns depends on what
         the SP or the registration authority has said it wants in the request
@@ -501,6 +547,8 @@ class Policy:
         :param required: Attributes that the SP requires in the assertion
         :param optional: Attributes that the SP regards as optional
         :return: A possibly modified AVA
+        :raises MissingValue: if a required attribute cannot be provided after
+            the local restrictions have been applied
         """
 
         if mdstore is not None:
@@ -512,31 +560,20 @@ class Policy:
             logger.warning(warn_msg)
             _warn(warn_msg, DeprecationWarning)
 
-        # acs MUST have a value, fall back to default.
-        if not self.acs:
-            self.acs = ac_factory()
+        decision = self.decide(
+            ava,
+            sp_entity_id,
+            required=required,
+            optional=optional,
+        )
 
-        subject_ava = ava.copy()
-
-        # entity category restrictions
-        _ent_rest = self.get_entity_categories(sp_entity_id, mds=mdstore, required=required)
-        if _ent_rest:
-            subject_ava = filter_attribute_value_assertions(subject_ava, _ent_rest)
-        elif required or optional:
-            logger.debug("required: %s, optional: %s", required, optional)
-            subject_ava = filter_on_attributes(
-                subject_ava,
-                required,
-                optional,
-                self.acs,
-                self.get_fail_on_missing_requested(sp_entity_id),
+        if not decision.is_satisfied():
+            entry = decision.missing[0]
+            raise MissingValue(
+                f"Required attribute missing: '{entry['attribute']}' ({entry['reason']})"
             )
 
-        # attribute restrictions
-        _attr_rest = self.get_attribute_restrictions(sp_entity_id)
-        subject_ava = filter_attribute_value_assertions(subject_ava, _attr_rest)
-
-        return subject_ava or {}
+        return decision.allowed or {}
 
     def restrict(self, ava, sp_entity_id, metadata=None):
         """Identity attribute names are expected to be expressed as FriendlyNames

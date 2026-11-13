@@ -1,6 +1,21 @@
 # Changelog
 
 
+## Unreleased
+
+- Harden IdP attribute release into a single, explainable decision that
+  combines local `attribute_restrictions`, entity categories and SP
+  `RequestedAttribute` name-format conversion. Remote requests can no longer
+  widen the local allow-list; FriendlyName/formal-Name conflicts and duplicate
+  NameFormats are merged instead of opening a second release path; empty values
+  are distinguished from absent attributes; and a required attribute withheld
+  by local policy now raises an explicit `MissingValue` rather than being
+  silently dropped. The new `Policy.decide()` returns an
+  `AttributeReleaseDecision` that records released attributes, filtered
+  attributes with reason codes/counts and unmet-required reasons without ever
+  exposing filtered values.
+
+
 ## v7.5.5 (2026-09-17)
 
 - Resolve CVE-2026-26007 by migrating to the from pyOpenSSL to the cryptography APIs

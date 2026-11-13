@@ -267,10 +267,19 @@ def test_ava_filter_2():
 
     ava = {"givenName": "Derek", "sn": "Jeter", "mail": "derek@example.com"}
 
-    # mail removed because it doesn't match the regular expression
-    _ava = policy.filter(ava, "urn:mace:umu.se:saml:roland:sp", required=[mail], optional=[gn, sn])
+    # mail removed because it doesn't match the regular expression.
+    # A required attribute that the local policy withholds must produce an
+    # explicit, explainable rejection rather than silently vanishing.
+    with raises(MissingValue):
+        policy.filter(ava, "urn:mace:umu.se:saml:roland:sp", required=[mail], optional=[gn, sn])
 
-    assert _eq(sorted(list(_ava.keys())), ["givenName", "sn"])
+    # the non-raising decision exposes the reason without the filtered value
+    decision = policy.decide(ava, "urn:mace:umu.se:saml:roland:sp", required=[mail], optional=[gn, sn])
+    assert not decision.is_satisfied()
+    assert decision.missing[0]["attribute"] == "mail"
+    assert decision.missing[0]["reason"] == "required_value_filtered"
+    assert _eq(sorted(decision.allowed.keys()), ["givenName", "sn"])
+    assert "derek@example.com" not in str(decision.explanation())
 
     ava = {"givenName": "Derek", "sn": "Jeter"}
 
