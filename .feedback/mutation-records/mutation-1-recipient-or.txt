@@ -1,0 +1,2 @@
+FAILED tests/test_95_subject_confirmation.py::TestSubjectConfirmationSecurity::test_keyless_hok_cannot_borrow_bearer_constraints
+========================= 1 failed, 17 passed in 1.20s =========================

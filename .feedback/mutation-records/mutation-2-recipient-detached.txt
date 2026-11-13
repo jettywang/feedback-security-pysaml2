@@ -1,0 +1,5 @@
+tests/test_95_subject_confirmation.py::TestSubjectConfirmationSecurity::test_bearer_missing_recipient_binding_is_rejected FAILED [ 27%]
+tests/test_95_subject_confirmation.py::TestSubjectConfirmationSecurity::test_keyless_hok_cannot_borrow_bearer_constraints FAILED [ 66%]
+FAILED tests/test_95_subject_confirmation.py::TestSubjectConfirmationSecurity::test_bearer_missing_recipient_binding_is_rejected
+FAILED tests/test_95_subject_confirmation.py::TestSubjectConfirmationSecurity::test_keyless_hok_cannot_borrow_bearer_constraints
+========================= 2 failed, 16 passed in 1.36s =========================
