@@ -435,6 +435,7 @@ class Entity(HTTPBase):
             BINDING_HTTP_REDIRECT,
             BINDING_HTTP_POST,
             BINDING_SOAP,
+            BINDING_PAOS,
             BINDING_URI,
             BINDING_HTTP_ARTIFACT,
             None,
@@ -452,6 +453,16 @@ class Entity(HTTPBase):
             elif binding == BINDING_SOAP:
                 func = getattr(soap, f"parse_soap_enveloped_saml_{msgtype}")
                 xmlstr = func(txt)
+            elif binding == BINDING_PAOS:
+                # The ECP/PAOS profile delivers the SAML Response inside a
+                # SOAP envelope. Callers commonly hand us the already
+                # extracted body (a class instance or its XML), so only
+                # unwrap when we actually received an envelope.
+                if isinstance(txt, str) and txt.lstrip().startswith("<Envelope"):
+                    func = getattr(soap, f"parse_soap_enveloped_saml_{msgtype}")
+                    xmlstr = func(txt)
+                else:
+                    xmlstr = txt
             elif binding == BINDING_HTTP_ARTIFACT:
                 xmlstr = base64.b64decode(txt)
             else:

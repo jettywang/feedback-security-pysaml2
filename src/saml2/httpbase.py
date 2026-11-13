@@ -111,6 +111,7 @@ class HTTPBase:
         self.sec = None
         self.user = None
         self.passwd = None
+        self._credential_origins = None
 
     def cookies(self, url):
         """
@@ -205,6 +206,46 @@ class HTTPBase:
                 new_cookie = http_cookiejar.Cookie(**std_attr)
                 self.cookiejar.set_cookie(new_cookie)
 
+    def _url_origin(self, url):
+        """Return the (scheme, host, port) origin of a URL."""
+        part = urlparse(url)
+        scheme = part.scheme.lower()
+        host = (part.hostname or "").lower()
+        try:
+            port = part.port
+        except ValueError:
+            port = None
+        if port is None:
+            port = {"http": 80, "https": 443}.get(scheme)
+        return scheme, host, port
+
+    def add_credentials(self, user, passwd, allow_urls=None):
+        """Set credentials and optionally restrict where they may be sent.
+
+        :param user: User name
+        :param passwd: Password
+        :param allow_urls: A URL or iterable of URLs whose origins may receive
+            these credentials. If omitted, no restriction is applied, which
+            keeps the historical behaviour for non-ECP callers.
+        """
+        self.user = user
+        self.passwd = passwd
+        if allow_urls is not None:
+            if isinstance(allow_urls, str):
+                allow_urls = [allow_urls]
+            self._credential_origins = {self._url_origin(url) for url in allow_urls}
+
+    def allow_credentials_for(self, url):
+        """Restrict HTTP credentials to the origin of the given URL.
+
+        Credentials supplied to this client are meant for the configured IdP.
+        They must never be sent to an origin learned from a response (for
+        example an AssertionConsumerServiceURL).
+        """
+        if self._credential_origins is None:
+            self._credential_origins = set()
+        self._credential_origins.add(self._url_origin(url))
+
     def send(self, url, method="GET", **kwargs):
         _kwargs = copy.copy(self.request_args)
         if kwargs:
@@ -215,7 +256,9 @@ class HTTPBase:
             if _cd:
                 _kwargs["cookies"] = _cd
 
-        if self.user and self.passwd:
+        if self.user and self.passwd and (
+            self._credential_origins is None or self._url_origin(url) in self._credential_origins
+        ):
             _kwargs["auth"] = (self.user, self.passwd)
 
         if "headers" in _kwargs and isinstance(_kwargs["headers"], list):
@@ -327,7 +370,3 @@ class HTTPBase:
             return response
         else:
             raise HTTPError("%d:%s" % (response.status_code, response.content))
-
-    def add_credentials(self, user, passwd):
-        self.user = user
-        self.passwd = passwd

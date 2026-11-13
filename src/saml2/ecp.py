@@ -150,7 +150,11 @@ def ecp_response(target_url, response):
     # <ecp:Response
     # ----------------------------------------
 
-    ecp_response = ecp.Response(assertion_consumer_service_url=target_url)
+    ecp_response = ecp.Response(
+        assertion_consumer_service_url=target_url,
+        must_understand="1",
+        actor=ACTOR,
+    )
     header = soapenv.Header()
     header.extension_elements = [element_to_extension_element(ecp_response)]
 
@@ -185,7 +189,11 @@ class ECPServer(Server):
         # ----------------------------------------
         target_url = ""
 
-        ecp_response = ecp.Response(assertion_consumer_service_url=target_url)
+        ecp_response = ecp.Response(
+        assertion_consumer_service_url=target_url,
+        must_understand="1",
+        actor=ACTOR,
+    )
         header = soapenv.Body()
         header.extension_elements = [element_to_extension_element(ecp_response)]
 

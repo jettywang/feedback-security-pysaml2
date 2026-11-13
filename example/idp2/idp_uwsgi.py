@@ -306,7 +306,15 @@ class SSO(Service):
 
         logger.info("AuthNResponse: %s", _resp)
         if self.op_type == "ecp":
-            kwargs = {"soap_headers": [ecp.Response(assertion_consumer_service_url=self.destination)]}
+            kwargs = {
+                "soap_headers": [
+                    ecp.Response(
+                        assertion_consumer_service_url=self.destination,
+                        must_understand="1",
+                        actor="http://schemas.xmlsoap.org/soap/actor/next",
+                    )
+                ]
+            }
         else:
             kwargs = {}
 

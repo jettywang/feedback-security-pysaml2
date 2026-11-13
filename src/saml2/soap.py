@@ -26,6 +26,47 @@ class WrongMessageType(Exception):
     pass
 
 
+class InvalidSoapEnvelope(ValueError):
+    """Raised when a SOAP envelope is ambiguous or structurally invalid."""
+
+
+HEADER_TAG = "{%s}Header" % soapenv.NAMESPACE
+BODY_TAG = "{%s}Body" % soapenv.NAMESPACE
+ENVELOPE_TAG = "{%s}Envelope" % soapenv.NAMESPACE
+
+
+def _envelope_parts(envelope):
+    """Return the single SOAP Header and Body of an envelope.
+
+    An envelope with zero or multiple Body elements is ambiguous and must not
+    be interpreted. The same applies to multiple Header elements and to a
+    Body that does not contain exactly one payload element.
+    """
+    if envelope.tag != ENVELOPE_TAG:
+        raise InvalidSoapEnvelope(f"Invalid envelope tag '{envelope.tag}' should be '{ENVELOPE_TAG}'")
+
+    headers = []
+    bodies = []
+    for part in envelope:
+        if part.tag == HEADER_TAG:
+            headers.append(part)
+        elif part.tag == BODY_TAG:
+            bodies.append(part)
+        else:
+            raise InvalidSoapEnvelope(f"Unexpected element '{part.tag}' in SOAP envelope")
+
+    if len(bodies) != 1:
+        raise InvalidSoapEnvelope(f"Expected exactly one SOAP Body, found {len(bodies)}")
+    if len(headers) > 1:
+        raise InvalidSoapEnvelope(f"Expected at most one SOAP Header, found {len(headers)}")
+
+    body = bodies[0]
+    if len(body) != 1:
+        raise InvalidSoapEnvelope(f"Expected a single child element in SOAP Body, found {len(body)}")
+
+    return headers, body
+
+
 def parse_soap_enveloped_saml_response(text):
     tags = ["{%s}Response" % SAMLP_NAMESPACE, "{%s}LogoutResponse" % SAMLP_NAMESPACE]
     return parse_soap_enveloped_saml_thingy(text, tags)
@@ -126,24 +167,7 @@ def parse_soap_enveloped_saml_thingy(text, expected_tags):
     """
     envelope = defusedxml.ElementTree.fromstring(text)
 
-    envelope_tag = "{%s}Envelope" % soapenv.NAMESPACE
-    if envelope.tag != envelope_tag:
-        raise ValueError(f"Invalid envelope tag '{envelope.tag}' should be '{envelope_tag}'")
-
-    if len(envelope) < 1:
-        raise Exception("No items in envelope.")
-
-    body = None
-    for part in envelope:
-        if part.tag == "{%s}Body" % soapenv.NAMESPACE:
-            n_children = len(part)
-            if n_children != 1:
-                raise Exception(f"Expected a single child element, found {n_children}")
-            body = part
-            break
-
-    if body is None:
-        return ""
+    _headers, body = _envelope_parts(envelope)
 
     saml_part = body[0]
     if saml_part.tag in expected_tags:
@@ -181,23 +205,13 @@ def class_instances_from_soap_enveloped_saml_thingies(text, modules):
     except Exception as exc:
         raise XmlParseError(f"{exc}")
 
-    envelope_tag = "{%s}Envelope" % soapenv.NAMESPACE
-    if envelope.tag != envelope_tag:
-        raise ValueError(f"Invalid envelope tag '{envelope.tag}' should be '{envelope_tag}'")
+    headers, body = _envelope_parts(envelope)
 
-    if len(envelope) < 1:
-        raise Exception("No items in envelope.")
+    env = {"header": [], "body": instanciate_class(body[0], modules)}
 
-    env = {"header": [], "body": None}
-
-    for part in envelope:
-        if part.tag == "{%s}Body" % soapenv.NAMESPACE:
-            if len(envelope) < 1:
-                raise Exception("No items in envelope part.")
-            env["body"] = instanciate_class(part[0], modules)
-        elif part.tag == "{%s}Header" % soapenv.NAMESPACE:
-            for item in part:
-                env["header"].append(instanciate_class(item, modules))
+    for header in headers:
+        for item in header:
+            env["header"].append(instanciate_class(item, modules))
 
     return env
 
@@ -213,24 +227,13 @@ def open_soap_envelope(text):
     except Exception as exc:
         raise XmlParseError(f"{exc}")
 
-    envelope_tag = "{%s}Envelope" % soapenv.NAMESPACE
-    if envelope.tag != envelope_tag:
-        raise ValueError(f"Invalid envelope tag '{envelope.tag}' should be '{envelope_tag}'")
+    headers, body = _envelope_parts(envelope)
 
-    if len(envelope) < 1:
-        raise Exception("No items in envelope.")
+    content = {"header": [], "body": ElementTree.tostring(body[0], encoding="UTF-8")}
 
-    content = {"header": [], "body": None}
-
-    for part in envelope:
-        if part.tag == "{%s}Body" % soapenv.NAMESPACE:
-            if len(envelope) < 1:
-                raise Exception("No items in envelope part.")
-            content["body"] = ElementTree.tostring(part[0], encoding="UTF-8")
-        elif part.tag == "{%s}Header" % soapenv.NAMESPACE:
-            for item in part:
-                _str = ElementTree.tostring(item, encoding="UTF-8")
-                content["header"].append(_str)
+    for header in headers:
+        for item in header:
+            content["header"].append(ElementTree.tostring(item, encoding="UTF-8"))
 
     return content
 

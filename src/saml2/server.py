@@ -21,6 +21,7 @@ from saml2.assertion import Policy
 from saml2.assertion import filter_attribute_value_assertions
 from saml2.assertion import restriction_from_attribute_spec
 import saml2.cryptography.symmetric
+from saml2.client_base import ACTOR
 from saml2.entity import Entity
 from saml2.eptid import Eptid
 from saml2.eptid import EptidShelve
@@ -1054,7 +1055,11 @@ class Server(Entity):
         # <ecp:Response
         # ----------------------------------------
 
-        ecp_response = ecp.Response(assertion_consumer_service_url=acs_url)
+        ecp_response = ecp.Response(
+            assertion_consumer_service_url=acs_url,
+            must_understand="1",
+            actor=ACTOR,
+        )
         header = soapenv.Header()
         header.extension_elements = [element_to_extension_element(ecp_response)]
 

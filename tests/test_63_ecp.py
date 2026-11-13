@@ -67,7 +67,7 @@ def test_complete_flow():
         cargs = client.parse_sp_ecp_response(respdict)
 
         assert isinstance(respdict["body"], AuthnRequest)
-        assert len(respdict["header"]) == 2
+        assert len(respdict["header"]) == 3
         item0 = respdict["header"][0]
         assert isinstance(item0, Request) or isinstance(item0, RelayState)
 

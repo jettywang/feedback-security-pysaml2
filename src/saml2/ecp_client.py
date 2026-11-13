@@ -14,6 +14,7 @@ from saml2 import SAMLError
 from saml2 import saml
 from saml2 import samlp
 from saml2 import soap
+from saml2.client_base import ACTOR
 from saml2.client_base import MIME_PAOS
 from saml2.config import Config
 from saml2.entity import Entity
@@ -22,7 +23,6 @@ from saml2.httpbase import set_list2dict
 from saml2.mdstore import MetadataStore
 from saml2.profile import ecp
 from saml2.profile import paos
-from saml2.s_utils import BadRequest
 
 
 SERVICE = "urn:oasis:names:tc:SAML:2.0:profiles:SSO:ecp"
@@ -31,11 +31,49 @@ PAOS_HEADER_INFO = f'ver="{paos.NAMESPACE}";"{SERVICE}"'
 logger = logging.getLogger(__name__)
 
 
+class ECPError(SAMLError):
+    """An ECP exchange violates the PAOS/ECP profile."""
+
+
+def _header_instances(respdict, namespace, tag):
+    return [item for item in respdict["header"] if item.c_tag == tag and item.c_namespace == namespace]
+
+
+def _single_header(respdict, namespace, tag, required=True):
+    items = _header_instances(respdict, namespace, tag)
+    if not items:
+        if required:
+            raise ECPError(f"Missing required SOAP header '{tag}'")
+        return None
+    if len(items) > 1:
+        raise ECPError(f"Expected a single SOAP header '{tag}', found {len(items)}")
+    return items[0]
+
+
+def _check_ecp_header_attributes(item, name):
+    if str(item.must_understand).lower() not in ("1", "true"):
+        raise ECPError(f"SOAP header '{name}' must have mustUnderstand='1'")
+    if item.actor != ACTOR:
+        raise ECPError(f"SOAP header '{name}' must be targeted at '{ACTOR}'")
+
+
 class Client(Entity):
     """ECP-aware client that works on the client (application) side.
 
     You can use this class when you want to login user through
     ECP-aware SP and IdP.
+
+    The three-party exchange is bound to a single login:
+
+    * ``paos:Request/@responseConsumerURL`` from the SP must equal
+      ``AuthnRequest/@AssertionConsumerServiceURL``.
+    * The IdP's ``ecp:Response/@AssertionConsumerServiceURL`` must equal that
+      same consumer URL, and the SAML Response must carry the matching
+      ``InResponseTo``.
+    * The response is POSTed only to the consumer URL from the original
+      request. ``ecp:RelayState`` is returned verbatim but is never used to
+      choose a destination.
+    * HTTP credentials are sent only to the IdP origin taken from metadata.
     """
 
     def __init__(
@@ -124,6 +162,10 @@ class Client(Entity):
 
         _, destination = self.pick_binding("single_sign_on_service", [BINDING_SOAP], "idpsso", entity_id=idp_entity_id)
 
+        # Credentials belong to the IdP endpoint found in trusted metadata.
+        # They are never attached to an address taken from a response.
+        self.allow_credentials_for(destination)
+
         ht_args = self.apply_binding(BINDING_SOAP, authn_request, destination, sign=sign, sigalg=sign_alg)
 
         if headers:
@@ -159,21 +201,38 @@ class Client(Entity):
 
         logger.debug("[P2] IdP AUTHN response: %s", idp_response)
 
-        _ecp_response = None
-        for item in respdict["header"]:
-            if item.c_tag == "Response" and item.c_namespace == ecp.NAMESPACE:
-                _ecp_response = item
+        # Exactly one ecp:Response must name the SP consumer that will
+        # receive this response. Duplicate or missing headers make the
+        # destination ambiguous and are rejected.
+        _ecp_response = _single_header(respdict, ecp.NAMESPACE, "Response")
+        _check_ecp_header_attributes(_ecp_response, "ecp:Response")
 
         _acs_url = _ecp_response.assertion_consumer_service_url
+        if not _acs_url:
+            raise ECPError("Missing AssertionConsumerServiceURL in ecp:Response")
+
         if rc_url != _acs_url:
-            error = (
-                f"response_consumer_url '{rc_url}' does not match",
-                f"assertion_consumer_service_url '{_acs_url}",
+            raise ECPError(
+                f"responseConsumerURL '{rc_url}' does not match AssertionConsumerServiceURL '{_acs_url}'"
             )
-            # Send an error message to the SP
-            _ = self.send(rc_url, "POST", data=soap.soap_fault(error))
-            # Raise an exception so the user knows something went wrong
-            raise SAMLError(error)
+
+        # The SAML response must answer this exact AuthnRequest. This binds
+        # the message sent to the IdP and the message returned to the SP to
+        # one login, even if another outstanding ECP exchange exists.
+        if not idp_response.in_response_to or idp_response.in_response_to != authn_request.id:
+            raise ECPError(
+                f"SAML Response InResponseTo '{idp_response.in_response_to}' does not match AuthnRequest ID "
+                f"'{authn_request.id}'"
+            )
+
+        if idp_response.destination and idp_response.destination != _acs_url:
+            raise ECPError(
+                f"SAML Response Destination '{idp_response.destination}' does not match "
+                f"AssertionConsumerServiceURL '{_acs_url}'"
+            )
+
+        if idp_entity_id and idp_response.issuer and idp_response.issuer.text != idp_entity_id:
+            raise ECPError(f"SAML Response Issuer '{idp_response.issuer.text}' does not match IdP '{idp_entity_id}'")
 
         return idp_response
 
@@ -195,19 +254,35 @@ class Client(Entity):
                 )
             )
 
-        # ecp.RelayState among headers
-        _relay_state = None
-        _paos_request = None
-        for item in respdict["header"]:
-            if item.c_tag == "RelayState" and item.c_namespace == ecp.NAMESPACE:
-                _relay_state = item
-            if item.c_tag == "Request" and item.c_namespace == paos.NAMESPACE:
-                _paos_request = item
+        # Exactly one paos:Request tells us which consumer URL the SP expects
+        # the assertion to be delivered to. The mandatory ecp:Request carries
+        # the SP issuer. RelayState is at most one block and is carried back
+        # verbatim; it is never used for routing.
+        _paos_request = _single_header(respdict, paos.NAMESPACE, "Request")
+        _check_ecp_header_attributes(_paos_request, "paos:Request")
+        if _paos_request.service != SERVICE:
+            raise ECPError(f"Unexpected PAOS service '{_paos_request.service}'")
 
-        if _paos_request is None:
-            raise BadRequest("Missing request")
+        _ecp_request = _single_header(respdict, ecp.NAMESPACE, "Request")
+        _check_ecp_header_attributes(_ecp_request, "ecp:Request")
+        if not _ecp_request.issuer or _ecp_request.issuer.text != authn_request.issuer.text:
+            raise ECPError("ecp:Request Issuer does not match the AuthnRequest issuer")
 
         _rc_url = _paos_request.response_consumer_url
+        if not _rc_url:
+            raise ECPError("Missing responseConsumerURL in paos:Request")
+
+        # Bind the delivery address to the signed/parsed AuthnRequest from
+        # the same SOAP message. A replaced PAOS header alone must not be
+        # able to choose another consumer.
+        _request_acs = authn_request.assertion_consumer_service_url
+        if _request_acs and _request_acs != _rc_url:
+            raise ECPError(
+                f"responseConsumerURL '{_rc_url}' does not match AuthnRequest "
+                f"AssertionConsumerServiceURL '{_request_acs}'"
+            )
+
+        _relay_state = _single_header(respdict, ecp.NAMESPACE, "RelayState", required=False)
 
         return {
             "authn_request": authn_request,
@@ -235,7 +310,11 @@ class Client(Entity):
         # Phase 3 - back to the SP
         # **********************************
 
-        ht_args = self.use_soap(idp_response, args["rc_url"], [args["relay_state"]])
+        # The destination is the consumer URL from the original SP request
+        # (after the phase 2 equality check above), never an address learned
+        # from RelayState or from the IdP.
+        soap_headers = [args["relay_state"]] if args["relay_state"] is not None else []
+        ht_args = self.use_soap(idp_response, args["rc_url"], soap_headers)
         ht_args["headers"][0] = ("Content-Type", MIME_PAOS)
         logger.debug("[P3] Post to SP: %s", ht_args["data"])
 
@@ -293,6 +372,14 @@ class Client(Entity):
         # headers needed to indicate to the SP that I'm ECP enabled
 
         opargs["headers"] = self.add_paos_headers(opargs["headers"])
+
+        # The user's credentials are for the IdP only. Deny them by default;
+        # phase 2 enables exactly the metadata-derived IdP origin. This keeps
+        # them off the SP conversation and off any address taken from a
+        # response.
+        if self.user and self.passwd:
+            self._credential_origins = set()
+
         response = self.send(sp_url, op, **opargs)
         logger.debug("[Op] SP response", extra={"response": response})
         print(response.text)

@@ -889,6 +889,15 @@ class Base(Entity):
         )
 
         # ----------------------------------------
+        # <ecp:Request>
+        # ----------------------------------------
+
+        ecp_request = ecp.Request(
+            must_understand="1",
+            actor=ACTOR,
+        )
+
+        # ----------------------------------------
         # <ecp:RelayState>
         # ----------------------------------------
 
@@ -929,23 +938,27 @@ class Base(Entity):
                 **kwargs,
             )
 
+        if ecp_request.issuer is None:
+            ecp_request.issuer = authn_req.issuer
+
         # ----------------------------------------
         # The SOAP envelope
         # ----------------------------------------
 
-        soap_envelope = make_soap_enveloped_saml_thingy(authn_req, [paos_request, relay_state])
+        soap_envelope = make_soap_enveloped_saml_thingy(authn_req, [paos_request, ecp_request, relay_state])
 
         return req_id, str(soap_envelope)
 
     def parse_ecp_authn_response(self, txt, outstanding=None):
         rdict = soap.class_instances_from_soap_enveloped_saml_thingies(txt, [paos, ecp, samlp])
 
-        _relay_state = None
-        for item in rdict["header"]:
-            if item.c_tag == "RelayState" and item.c_namespace == ecp.NAMESPACE:
-                _relay_state = item
+        relays = [item for item in rdict["header"] if item.c_tag == "RelayState" and item.c_namespace == ecp.NAMESPACE]
+        if len(relays) > 1:
+            raise SAMLError("Multiple RelayState headers in ECP response")
 
-        response = self.parse_authn_request_response(rdict["body"], BINDING_PAOS, outstanding)
+        _relay_state = relays[0] if relays else None
+
+        response = self.parse_authn_request_response(f"{rdict['body']}", BINDING_PAOS, outstanding)
 
         return response, _relay_state
 
