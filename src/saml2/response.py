@@ -12,6 +12,9 @@ from saml2 import time_util
 from saml2 import xmldsig as ds
 from saml2 import xmlenc as xenc
 from saml2.attribute_converter import to_local
+from saml2.failure import SAMLFailure
+from saml2.failure import attach_failure
+from saml2.failure import status_code_chain
 from saml2.s_utils import RequestVersionTooHigh
 from saml2.s_utils import RequestVersionTooLow
 from saml2.saml import SCM_BEARER
@@ -77,7 +80,9 @@ class VerificationError(SAMLError):
 
 
 class StatusError(SAMLError):
-    pass
+    #: Structured :class:`saml2.failure.SAMLFailure` when raised by the
+    #: response processing, ``None`` for exceptions built directly by callers.
+    failure = None
 
 
 class UnsolicitedResponse(SAMLError):
@@ -222,6 +227,29 @@ def for_me(conditions, myself):
     return False
 
 
+def attach_parse_failure(exception, xmlstr=None):
+    """Attach a MALFORMED structured failure to a parse/validation exception.
+
+    Parse errors never carry trust, so any self-asserted status inside the
+    payload is ignored: the failure stays a protocol level rejection.
+    """
+    detail = str(exception) or exception.__class__.__name__
+    failure = SAMLFailure.for_malformed(xmlstr, detail=detail)
+    return attach_failure(exception, failure)
+
+
+def attach_signature_failure(exception, xmlstr=None):
+    """Attach a SIGNATURE structured failure to a signature exception.
+
+    The status of an unauthenticated response is captured for diagnostics
+    only; ``trusted`` is always False and the result can never become a
+    business level status failure.
+    """
+    detail = str(exception) or exception.__class__.__name__
+    failure = SAMLFailure.for_untrusted(xmlstr, detail=detail)
+    return attach_failure(exception, failure)
+
+
 def authn_response(
     conf,
     return_addrs,
@@ -298,6 +326,13 @@ class StatusResponse:
         self.asynchop = asynchop
         self.do_not_verify = False
         self.conv_info = conv_info or {}
+        # Whether the envelope carried a signature that verified against a
+        # trusted key. Only trusted responses may base business decisions on
+        # their self-asserted status.
+        self.verified_signature = False
+        # True once the envelope has been parsed, even if it had no usable
+        # signature; allows untrusted statuses to be classified correctly.
+        self.signature_evaluated = False
 
     def _clear(self):
         self.xmlstr = ""
@@ -310,7 +345,7 @@ class StatusResponse:
             logger.warning("Response was not correctly signed")
             if self.xmlstr:
                 logger.debug("Response: %s", self.xmlstr)
-            raise IncorrectlySigned()
+            raise attach_signature_failure(IncorrectlySigned(), self.xmlstr)
 
         logger.debug("response: %s", self.response)
 
@@ -332,10 +367,12 @@ class StatusResponse:
             except SignatureError:
                 # The response as a whole might be signed or not
                 self.response = self.sec.check_signature(instance, f"{samlp.NAMESPACE}:Response")
+            self.verified_signature = True
         else:
             self.not_signed = True
             self.response = instance
 
+        self.signature_evaluated = True
         return self._postamble()
 
     def _loads(self, xmldata, decode=True, origxml=None):
@@ -367,13 +404,61 @@ class StatusResponse:
 
         except TypeError:
             raise
-        except SignatureError:
+        except SignatureError as exc:
+            self.signature_evaluated = True
+            attach_signature_failure(exc, self.xmlstr)
             raise
         except Exception as excp:
+            # Covers malformed XML and schema violations. Such messages can
+            # not be authenticated and therefore never carry a trusted
+            # status.
+            attach_parse_failure(excp, self.xmlstr)
             logger.exception("EXCEPTION: %s", str(excp))
             raise
 
+        self.signature_evaluated = True
+        self.verified_signature = bool(getattr(self.response, "signature", None))
+
         return self._postamble()
+
+    def is_trusted(self):
+        """Whether the envelope was authenticated by a verified signature.
+
+        Only trusted responses are allowed to influence business level
+        handling such as MFA or passive login downgrades.
+        """
+        return self.signature_evaluated and self.verified_signature
+
+    def build_status_failure(self):
+        """Build a structured failure for a non-success SAML status.
+
+        The returned :class:`saml2.failure.SAMLFailure` carries the full
+        status code chain and correlation information. Its ``trusted`` flag
+        reflects the signature state of the response; callers must not treat
+        untrusted statuses as IdP reported business failures.
+        """
+        return SAMLFailure.for_status(self.response.status, self.response, trusted=self.is_trusted())
+
+    def _status_exception(self):
+        status = self.response.status
+        chain = status_code_chain(status)
+        # The exception class follows the most specific status code, falling
+        # back through the chain (e.g. Responder/NoAuthnContext -> NoAuthnContext).
+        err_cls = StatusError
+        for value in reversed(chain):
+            err_cls = STATUSCODE2EXCEPTION.get(value)
+            if err_cls is not None:
+                break
+
+        failure = self.build_status_failure()
+        # Only fixed-vocabulary, localised-safe reason codes and SAML status
+        # URIs go into the exception message: the raw StatusMessage is kept
+        # out of logs and must never be rendered on a web page.
+        message = (
+            f"Unsuccessful SAML operation: reason={failure.public_reason} "
+            f"status_codes={chain} trusted={failure.trusted}"
+        )
+        return attach_failure(err_cls(message), failure)
 
     def status_ok(self):
         status = self.response.status
@@ -382,13 +467,12 @@ class StatusResponse:
         if not status or status.status_code.value == samlp.STATUS_SUCCESS:
             return True
 
-        err_code = status.status_code.status_code.value if status.status_code.status_code else None
-        err_msg = status.status_message.text if status.status_message else err_code or "Unknown error"
-        err_cls = STATUSCODE2EXCEPTION.get(err_code, StatusError)
-
-        msg = f"Unsuccessful operation: {status}\n{err_msg} from {err_code}"
-        logger.debug(msg)
-        raise err_cls(msg)
+        logger.debug(
+            "Unsuccessful SAML status (trusted=%s): %s",
+            self.is_trusted(),
+            status_code_chain(status),
+        )
+        raise self._status_exception()
 
     def issue_instant_ok(self):
         """Check that the response was issued at a reasonable time"""
@@ -435,6 +519,9 @@ class StatusResponse:
         self.xmlstr = mold.xmlstr
         self.in_response_to = mold.in_response_to
         self.response = mold.response
+        self.not_signed = mold.not_signed
+        self.verified_signature = mold.verified_signature
+        self.signature_evaluated = mold.signature_evaluated
 
     def issuer(self):
         issuer_value = (self.response.issuer.text if self.response.issuer is not None else "").strip()
@@ -1382,9 +1469,11 @@ class AssertionIDResponse:
             self.assertion = self.response
         except TypeError:
             raise
-        except SignatureError:
+        except SignatureError as exc:
+            attach_signature_failure(exc, self.xmlstr)
             raise
         except Exception as excp:
+            attach_parse_failure(excp, self.xmlstr)
             logger.exception("EXCEPTION: %s", str(excp))
             raise
 
@@ -1405,7 +1494,7 @@ class AssertionIDResponse:
             logger.warning("Response was not correctly signed")
             if self.xmlstr:
                 logger.debug("Response: %s", self.xmlstr)
-            raise IncorrectlySigned()
+            raise attach_signature_failure(IncorrectlySigned(), self.xmlstr)
 
         logger.debug("response: %s", self.response)
 

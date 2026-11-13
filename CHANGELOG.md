@@ -1,6 +1,18 @@
 # Changelog
 
 
+## Unreleased
+
+- Add structured response failures (`saml2.failure.SAMLFailure`) attached to
+  the existing response exceptions, separating malformed messages, signature
+  failures and authenticated SAML status failures. Status failures only count
+  as business failures when the response carried a verified signature, so an
+  unauthenticated response can never trigger a login downgrade. The full
+  nested `StatusCode` chain and request correlation data are exposed together
+  with a fixed, public-safe reason; raw `StatusMessage` text is no longer
+  placed in exception messages or logs.
+
+
 ## v7.5.5 (2026-09-17)
 
 - Resolve CVE-2026-26007 by migrating to the from pyOpenSSL to the cryptography APIs

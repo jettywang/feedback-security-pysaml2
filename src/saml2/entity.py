@@ -35,6 +35,8 @@ from saml2.profile import paos
 from saml2.profile import samlec
 from saml2.response import LogoutResponse
 from saml2.response import UnsolicitedResponse
+from saml2.response import attach_parse_failure
+from saml2.response import attach_signature_failure
 from saml2.s_utils import UnravelError
 from saml2.s_utils import UnsupportedBinding
 from saml2.s_utils import decode_base64_and_inflate
@@ -1450,6 +1452,11 @@ class Entity(HTTPBase):
             response.require_response_signature = True
             response = response.loads(xmlstr, False, origxml=xmlstr)
         except SigverError as err:
+            if not getattr(err, "failure", None):
+                # A failure result may already have been attached by the
+                # response loader; only synthesise one for errors raised
+                # outside of it.
+                attach_signature_failure(err, xmlstr)
             if require_response_signature:
                 logger.error("Signature Error: %s", str(err))
                 raise
@@ -1463,6 +1470,8 @@ class Entity(HTTPBase):
             logger.error("Unsolicited response")
             raise
         except Exception as err:
+            if not getattr(err, "failure", None):
+                attach_parse_failure(err, xmlstr)
             if "not well-formed" in f"{err}":
                 logger.error("Not well-formed XML")
             raise
@@ -1502,12 +1511,21 @@ class Entity(HTTPBase):
             # signature on the assertion is correct if present.
             response.verify(keys)
         except SignatureError as err:
+            if not getattr(err, "failure", None):
+                attach_signature_failure(err, xmlstr)
             if require_signature:
                 logger.error("Signature Error: %s", str(err))
                 raise
             else:
                 response.require_signature = require_signature
                 response.verify(keys)
+        except Exception as err:
+            # Assertion/XML level validation failures. The envelope might be
+            # trusted but the payload is not usable, so this stays a protocol
+            # rejection rather than a business status failure.
+            if not getattr(err, "failure", None):
+                attach_parse_failure(err, xmlstr)
+            raise
         else:
             assertions_are_signed = True
         finally:
@@ -1519,7 +1537,7 @@ class Entity(HTTPBase):
             if not response_is_signed and not assertions_are_signed:
                 msg = "Neither the response nor the assertions are signed"
                 logger.error(msg)
-                raise SigverError(msg)
+                raise attach_signature_failure(SigverError(msg), xmlstr)
 
         return response
 

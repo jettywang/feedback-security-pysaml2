@@ -36,5 +36,6 @@ WSGI or non-WSGI environment.
    :maxdepth: 1
 
    config
+   response_failures
 
 
