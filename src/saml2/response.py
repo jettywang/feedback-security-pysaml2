@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 #
-import calendar
 import logging
 
 from saml2 import SAMLError
@@ -226,14 +225,14 @@ def authn_response(
     conf,
     return_addrs,
     outstanding_queries=None,
-    timeslack=0,
+    timeslack=None,
     asynchop=True,
     allow_unsolicited=False,
     want_assertions_signed=False,
     conv_info=None,
 ):
     sec = security_context(conf)
-    if not timeslack:
+    if timeslack is None:
         try:
             timeslack = int(conf.accepted_time_diff)
         except TypeError:
@@ -254,9 +253,9 @@ def authn_response(
 
 
 # comes in over SOAP so synchronous
-def attribute_response(conf, return_addrs, timeslack=0, asynchop=False, test=False, conv_info=None):
+def attribute_response(conf, return_addrs, timeslack=None, asynchop=False, test=False, conv_info=None):
     sec = security_context(conf)
-    if not timeslack:
+    if timeslack is None:
         try:
             timeslack = int(conf.accepted_time_diff)
         except TypeError:
@@ -289,6 +288,7 @@ class StatusResponse:
         self.name_id = None
         self.response = None
         self.not_on_or_after = 0
+        self.subject_confirmation_not_on_or_after = 0
         self.in_response_to = None
         self.signature_check = self.sec.correctly_signed_response
         self.require_signature = False
@@ -304,6 +304,7 @@ class StatusResponse:
         self.name_id = None
         self.response = None
         self.not_on_or_after = 0
+        self.subject_confirmation_not_on_or_after = 0
 
     def _postamble(self):
         if not self.response:
@@ -505,6 +506,17 @@ class AuthnResponse(StatusResponse):
         self.ava = None
         self.assertion = None
         self.assertions = []
+        # Three distinct time bounds are tracked separately:
+        # - assertion_not_on_or_after: Conditions/@NotOnOrAfter, the latest
+        #   time the assertion itself may be consumed
+        # - subject_confirmation_not_on_or_after:
+        #   SubjectConfirmationData/@NotOnOrAfter, the latest time the
+        #   bearer/HoK confirmation may be presented
+        # - session_not_on_or_after: AuthnStatement/@SessionNotOnOrAfter,
+        #   how long the session established by this assertion may live
+        # All three are stored as plain UTC epoch seconds, without any clock
+        # slack added, so that acceptance slack never extends session life.
+        self.assertion_not_on_or_after = 0
         self.session_not_on_or_after = 0
         self.allow_unsolicited = allow_unsolicited
         self.require_signature = want_assertions_signed
@@ -563,9 +575,11 @@ class AuthnResponse(StatusResponse):
 
         authn_statement = self.assertion.authn_statement[0]
         if authn_statement.session_not_on_or_after:
+            # The slack only decides whether the response may still be
+            # accepted right now; it must not lengthen the stored session.
             if validate_on_or_after(authn_statement.session_not_on_or_after, self.timeslack):
-                self.session_not_on_or_after = calendar.timegm(
-                    time_util.str_to_time(authn_statement.session_not_on_or_after)
+                self.session_not_on_or_after = time_util.to_epoch(
+                    authn_statement.session_not_on_or_after
                 )
             else:
                 return False
@@ -597,7 +611,11 @@ class AuthnResponse(StatusResponse):
 
         try:
             if conditions.not_on_or_after:
-                self.not_on_or_after = validate_on_or_after(conditions.not_on_or_after, self.timeslack)
+                # Acceptance check (slack widens the acceptance window only);
+                # the stored bound is the raw timestamp without slack.
+                validate_on_or_after(conditions.not_on_or_after, self.timeslack)
+                self.assertion_not_on_or_after = time_util.to_epoch(conditions.not_on_or_after)
+                self.not_on_or_after = self.assertion_not_on_or_after
             if conditions.not_before:
                 validate_before(conditions.not_before, self.timeslack)
         except Exception as excp:
@@ -605,6 +623,7 @@ class AuthnResponse(StatusResponse):
             if not lax:
                 raise
             else:
+                self.assertion_not_on_or_after = 0
                 self.not_on_or_after = 0
 
         if not for_me(conditions, self.entity_id):
@@ -690,6 +709,9 @@ class AuthnResponse(StatusResponse):
         # These two will raise exception if untrue
         validate_on_or_after(data.not_on_or_after, self.timeslack)
         validate_before(data.not_before, self.timeslack)
+
+        if data.not_on_or_after:
+            self.subject_confirmation_not_on_or_after = time_util.to_epoch(data.not_on_or_after)
 
         # not_before must be < not_on_or_after
         if not later_than(data.not_on_or_after, data.not_before):
@@ -1067,15 +1089,27 @@ class AuthnResponse(StatusResponse):
             res[adstat.decision.text.lower()] = adstat
         return res
 
+    def session_expiration(self):
+        """Return when the established session expires as a UTC epoch second.
+
+        The SessionNotOnOrAfter of the AuthnStatement is the session bound.
+        When it is missing or conflicts with the assertion Conditions bound,
+        the earliest explicitly stated bound is used so that a missing value
+        can never turn into an unlimited session. Clock slack is never part of
+        the result: it only widens the window in which the response may be
+        accepted, it does not grant extra session lifetime.
+        """
+        bounds = [bound for bound in (self.session_not_on_or_after, self.assertion_not_on_or_after) if bound > 0]
+        if not bounds:
+            return 0
+        return min(bounds)
+
     def session_info(self):
         """Returns a predefined set of information gleened from the
         response.
         :returns: Dictionary with information
         """
-        if self.session_not_on_or_after > 0:
-            nooa = self.session_not_on_or_after
-        else:
-            nooa = self.not_on_or_after
+        nooa = self.session_expiration()
 
         if self.context == "AuthzQuery":
             return {
@@ -1293,7 +1327,7 @@ def response_factory(
     conf,
     return_addrs=None,
     outstanding_queries=None,
-    timeslack=0,
+    timeslack=None,
     decode=True,
     request_id=0,
     origxml=None,
@@ -1303,7 +1337,7 @@ def response_factory(
     conv_info=None,
 ):
     sec_context = security_context(conf)
-    if not timeslack:
+    if timeslack is None:
         try:
             timeslack = int(conf.accepted_time_diff)
         except TypeError:

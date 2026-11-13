@@ -119,12 +119,16 @@ class Cache:
             assertion
         :param info: The session info, the assertion is part of this
         :param not_on_or_after: A time after which the assertion is not valid.
+            Stored as a UTC epoch second regardless of whether it was given
+            as an epoch second, a struct_time or a SAML dateTime string, so
+            that reads interpret it with the same time scale as writes.
         """
         info = dict(info)
         if "name_id" in info and not isinstance(info["name_id"], str):
             # make friendly to (JSON) serialization
             info["name_id"] = code(name_id)
 
+        not_on_or_after = time_util.to_epoch(not_on_or_after)
         cni = code(name_id)
         if cni not in self._db:
             self._db[cni] = {}

@@ -6,12 +6,8 @@ from pymongo.mongo_client import MongoClient
 
 __author__ = "rolandh"
 
-from datetime import datetime
-import time
-
 from saml2 import time_util
 from saml2.cache import TooOld
-from saml2.time_util import TIME_FORMAT
 
 
 logger = logging.getLogger(__name__)
@@ -112,10 +108,11 @@ class Cache:
             assertion
         :param info: The session info, the assertion is part of this
         :param timestamp: A time after which the assertion is not valid.
+            Normalized to a UTC epoch second so reads and writes share the
+            same time interpretation.
         """
 
-        if isinstance(timestamp, datetime) or isinstance(timestamp, time.struct_time):
-            timestamp = time.strftime(TIME_FORMAT, timestamp)
+        timestamp = time_util.to_epoch(timestamp)
 
         doc = {
             "subject_id": subject_id,

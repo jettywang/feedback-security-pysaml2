@@ -104,7 +104,10 @@ class Cache:
             assertion
         :param info: The session info, the assertion is part of this
         :param timestamp: A time after which the assertion is not valid.
+            Normalized to a UTC epoch second so reads and writes share the
+            same time interpretation.
         """
+        timestamp = time_util.to_epoch(timestamp)
         entities = self._cache.get(subject_id)
         if not entities:
             entities = []

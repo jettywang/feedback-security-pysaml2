@@ -18,6 +18,34 @@ TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 TIME_FORMAT_WITH_FRAGMENT = re.compile(r"^(\d{4,4}-\d{2,2}-\d{2,2}T\d{2,2}:\d{2,2}:\d{2,2})(\.\d*)?Z?$")
 
 # ---------------------------------------------------------------------------
+# Fixed clock support
+#
+# All functions that need a notion of "now" go through utc_now(). Tests can
+# pin the clock to a fixed point in time with set_fixed_clock() so that the
+# same instant is observed by response validation and the session cache.
+# ---------------------------------------------------------------------------
+
+
+_fixed_clock = None
+
+
+def set_fixed_clock(time_stamp):
+    """Pin the clock used by :func:`utc_now` to a fixed UTC epoch second.
+
+    Pass ``None`` to restore the real system clock.
+    """
+    global _fixed_clock
+    if time_stamp is None:
+        _fixed_clock = None
+    else:
+        _fixed_clock = int(time_stamp)
+
+
+def get_fixed_clock():
+    """Return the fixed clock value, or None if the real clock is used."""
+    return _fixed_clock
+
+# ---------------------------------------------------------------------------
 # I'm sure this is implemented somewhere else can't find it now though, so I
 # made an attempt.
 # Implemented according to
@@ -176,6 +204,8 @@ def time_in_a_while(days=0, seconds=0, microseconds=0, milliseconds=0, minutes=0
     :return: UTC time
     """
     delta = timedelta(days, seconds, microseconds, milliseconds, minutes, hours, weeks)
+    if _fixed_clock is not None:
+        return datetime.fromtimestamp(_fixed_clock, tz=timezone.utc) + delta
     return datetime.now(timezone.utc) + delta
 
 
@@ -186,6 +216,8 @@ def time_a_while_ago(days=0, seconds=0, microseconds=0, milliseconds=0, minutes=
                     minutes[, hours[, weeks]]]]]]])
     """
     delta = timedelta(days, seconds, microseconds, milliseconds, minutes, hours, weeks)
+    if _fixed_clock is not None:
+        return datetime.fromtimestamp(_fixed_clock, tz=timezone.utc) - delta
     return datetime.now(timezone.utc) - delta
 
 
@@ -251,10 +283,35 @@ def instant(format=TIME_FORMAT, time_stamp=0):
 
 
 # ---------------------------------------------------------------------------
+# Fixed clock support
+#
+# All functions that need a notion of "now" go through utc_now(). Tests can
+# pin the clock to a fixed point in time with set_fixed_clock() so that the
+# same instant is observed by response validation and the session cache.
+# ---------------------------------------------------------------------------
 
 
 def utc_now():
+    if _fixed_clock is not None:
+        return _fixed_clock
     return calendar.timegm(time.gmtime())
+
+
+def to_epoch(point):
+    """Normalize a time specification to a UTC epoch second.
+
+    Accepts an epoch second, a time.struct_time (interpreted as UTC, which is
+    what :func:`str_to_time` returns) or a SAML dateTime string. A falsy
+    value (missing time bound) is returned unchanged so callers can tell
+    "no limit given" apart from a real timestamp.
+    """
+    if not point:
+        return point
+    if isinstance(point, str):
+        return calendar.timegm(str_to_time(point))
+    if isinstance(point, time.struct_time):
+        return calendar.timegm(point)
+    return int(point)
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +331,7 @@ def before(point):
     elif isinstance(point, int):
         point = time.gmtime(point)
 
-    return time.gmtime() <= point
+    return time.gmtime(utc_now()) <= point
 
 
 def after(point):
@@ -296,7 +353,7 @@ valid = before
 
 
 def utc_time_sans_frac():
-    return int("%d" % time.mktime(time.gmtime()))
+    return utc_now()
 
 
 def later_than(after, before):

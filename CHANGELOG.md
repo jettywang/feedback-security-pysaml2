@@ -1,6 +1,26 @@
 # Changelog
 
 
+## Unreleased
+
+- Separate the three SAML time bounds on `AuthnResponse`: the assertion
+  Conditions bound, the SubjectConfirmationData bound and the
+  AuthnStatement session bound are recorded independently.
+- Add `AuthnResponse.session_expiration()` and
+  `assertion_not_on_or_after`; `session_info()` now derives the session
+  lifetime from the earliest explicitly stated bound so a missing bound can
+  never create an unlimited session. Clock slack only widens response
+  acceptance and no longer contributes to session lifetime.
+- Normalize cache expiry timestamps to UTC epoch seconds on write
+  (`cache`, `mcache`, `mdbcache`) so reads and writes share one time
+  interpretation.
+- Add `time_util.set_fixed_clock()`/`get_fixed_clock()` and `to_epoch()`
+  for deterministic, fixed-clock testing; make `utc_time_sans_frac()`
+  timezone-correct.
+- Treat an explicit `timeslack=0` as intentional instead of falling back to
+  the configured `accepted_time_diff`.
+
+
 ## v7.5.5 (2026-09-17)
 
 - Resolve CVE-2026-26007 by migrating to the from pyOpenSSL to the cryptography APIs
