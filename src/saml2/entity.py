@@ -335,7 +335,13 @@ class Entity(HTTPBase):
             try:
                 srvs = sfunc(entity_id, binding, descr_type)
                 if srvs:
-                    if _url:
+                    if _url and _index:
+                        # Both selectors present: only accept when they
+                        # identify one and the same registered endpoint.
+                        for srv in srvs:
+                            if srv["location"] == _url and srv["index"] == _index:
+                                return binding, _url
+                    elif _url:
                         for srv in srvs:
                             if srv["location"] == _url:
                                 return binding, _url
