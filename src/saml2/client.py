@@ -18,7 +18,6 @@ from saml2.client_base import LogoutError
 from saml2.client_base import NoServiceDefined
 from saml2.client_base import SignOnError
 from saml2.httpbase import HTTPError
-from saml2.ident import code
 from saml2.ident import decode
 from saml2.mdstore import locations
 from saml2.s_utils import sid
@@ -27,6 +26,8 @@ from saml2.s_utils import success_status_factory
 from saml2.saml import AssertionIDRef
 from saml2.samlp import STATUS_REQUEST_DENIED
 from saml2.samlp import STATUS_UNKNOWN_PRINCIPAL
+from saml2.slo import LocalSessionCleaned
+from saml2.slo import SingleLogoutCoordinator
 from saml2.time_util import not_on_or_after
 
 
@@ -225,6 +226,44 @@ class Saml2Client(Base):
             digest_alg=digest_alg,
         )
 
+    def start_single_logout(
+        self,
+        name_id,
+        entity_ids=None,
+        reason="",
+        expire=None,
+        sign=None,
+        expected_binding=None,
+        sign_alg=None,
+        digest_alg=None,
+    ):
+        """Start a stateful coordinated single logout.
+
+        Every IdP keeps an independent result in the returned
+        :class:`~saml2.slo.SingleLogoutCoordinator`, so a participant that
+        times out or refuses never discards the results already collected and
+        the caller can later retry only the unfinished participants.
+
+        :return: the coordinator; its ``state`` attribute holds the
+            per-participant results and ``start()`` returns the same kind of
+            ``{entity_id: (binding, http_info) / LogoutResponse}`` mapping the
+            legacy :meth:`do_logout` used to return.
+        """
+        if entity_ids is None:
+            entity_ids = self.users.issuers_of_info(name_id)
+        coordinator = SingleLogoutCoordinator.get_or_create(
+            self,
+            name_id,
+            entity_ids=entity_ids,
+            reason=reason,
+            expire=expire,
+            sign=sign,
+            sign_alg=sign_alg,
+            digest_alg=digest_alg,
+        )
+        coordinator.start(expected_binding=expected_binding)
+        return coordinator
+
     def do_logout(
         self,
         name_id,
@@ -237,18 +276,19 @@ class Saml2Client(Base):
         digest_alg=None,
         **kwargs,
     ):
-        """
+        """Backward compatible single logout entry point.
 
-        :param name_id: Identifier of the Subject (a NameID instance)
-        :param entity_ids: List of entity ids for the IdPs that have provided
-            information concerning the subject
-        :param reason: The reason for doing the logout
-        :param expire: Try to logout before this time.
-        :param sign: Whether to sign the request or not
-        :param expected_binding: Specify the expected binding then not try it
-            all
-        :param kwargs: Extra key word arguments.
-        :return:
+        Internally this now drives a :class:`~saml2.slo.SingleLogoutCoordinator`
+        which preserves each participant's outcome. The return value keeps the
+        historical shape: a dict keyed by entity id with
+        ``(binding, http_info)`` for asynchronous bindings and the parsed
+        response for SOAP. When at least one participant cannot finish, the
+        legacy :class:`~saml2.client_base.LogoutError` is raised *after* the
+        full state has been retained on the client (``self.slo_states``) and
+        on the exception, so callers can retry just the missing parties.
+
+        :return: dict of responses, or the historical
+            ``(0, "504 Gateway Timeout", [], [])`` tuple when expired.
         """
         # check time
         if not not_on_or_after(expire):  # I've run out of time
@@ -256,128 +296,60 @@ class Saml2Client(Base):
             self.local_logout(name_id)
             return 0, "504 Gateway Timeout", [], []
 
-        not_done = entity_ids[:]
-        responses = {}
+        coordinator = self.start_single_logout(
+            name_id,
+            entity_ids=entity_ids,
+            reason=reason,
+            expire=expire,
+            sign=sign,
+            expected_binding=expected_binding,
+            sign_alg=sign_alg,
+            digest_alg=digest_alg,
+        )
 
-        bindings_slo_preferred = self.config.preferred_binding["single_logout_service"]
+        responses = self._logout_responses(coordinator)
 
-        for entity_id in entity_ids:
-            logger.debug("Logout from '%s'", entity_id)
-
-            bindings_slo_supported = self.metadata.single_logout_service(entity_id=entity_id, typ="idpsso")
-            bindings_slo_preferred_and_supported = (
-                binding for binding in bindings_slo_preferred if binding in bindings_slo_supported
-            )
-            bindings_slo_choices = filter(
-                lambda x: x,
-                (
-                    expected_binding,
-                    *bindings_slo_preferred_and_supported,
-                    *bindings_slo_supported,
-                ),
-            )
-            binding = next(bindings_slo_choices, None)
-            if not binding:
-                logger.info(
-                    {
-                        "message": "Entity does not support SLO",
-                        "entity": entity_id,
-                    }
-                )
-                continue
-
-            service_info = bindings_slo_supported[binding]
-            service_location = next(locations(service_info), None)
-            if not service_location:
-                logger.info(
-                    {
-                        "message": "Entity SLO service does not have a location",
-                        "entity": entity_id,
-                        "service_location": service_location,
-                    }
-                )
-                continue
-
-            try:
-                session_info = self.users.get_info_from(name_id, entity_id, False)
-                session_index = session_info.get("session_index")
-                session_indexes = [session_index] if session_index else None
-            except KeyError:
-                session_indexes = None
-
-            sign = sign if sign is not None else self.logout_requests_signed
-            sign_redirect = sign and binding == BINDING_HTTP_REDIRECT
-            sign_post = sign and not sign_redirect
-
-            log_report = {
-                "message": "Invoking SLO on entity",
-                "entity": entity_id,
-                "binding": binding,
-                "location": service_location,
-                "session_indexes": session_indexes,
-                "sign": sign,
-            }
-            logger.info(log_report)
-
-            req_id, request = self.create_logout_request(
-                service_location,
-                entity_id,
-                name_id=name_id,
-                reason=reason,
-                expire=expire,
-                session_indexes=session_indexes,
-                sign=sign_post,
-                sign_alg=sign_alg,
-                digest_alg=digest_alg,
-            )
-            relay_state = self._relay_state(req_id)
-            http_info = self.apply_binding(
-                binding,
-                str(request),
-                service_location,
-                relay_state,
-                sign=sign_redirect,
-                sigalg=sign_alg,
-            )
-
-            if binding == BINDING_SOAP:
-                response = self.send(**http_info)
-                if response and response.status_code == 200:
-                    not_done.remove(entity_id)
-                    response_text = response.text
-                    log_report_response = {
-                        **log_report,
-                        "message": "Response from SLO service",
-                        "response_text": response_text,
-                    }
-                    logger.debug(log_report_response)
-                    res = self.parse_logout_request_response(response_text, binding)
-                    responses[entity_id] = res
-                else:
-                    log_report_response = {
-                        **log_report,
-                        "message": "Bad status_code response from SLO service",
-                        "status_code": (response and response.status_code),
-                    }
-                    logger.info(log_report_response)
-            else:
-                self.state[req_id] = {
-                    "entity_id": entity_id,
-                    "operation": "SLO",
-                    "entity_ids": entity_ids,
-                    "name_id": code(name_id),
-                    "reason": reason,
-                    "not_on_or_after": expire,
-                    "sign": sign,
-                }
-                responses[entity_id] = (binding, http_info)
-                not_done.remove(entity_id)
-
-        if not_done:
-            # upstream should try later
-            raise LogoutError(f"{entity_ids}")
+        # Historical semantics: an asynchronous request that was handed to the
+        # browser is considered "done" by do_logout; only participants that
+        # could not even be contacted (SOAP failure/timeout/unsupported) keep
+        # the operation incomplete. Their full results are still retained.
+        blocked = [
+            p
+            for p in coordinator.state.unfinished()
+            if p.state not in ("in_progress",)
+        ]
+        if blocked:
+            error = LogoutError(f"{[p.entity_id for p in blocked]}")
+            error.coordinator = coordinator
+            error.logout_state = coordinator.state
+            error.unfinished = [p.entity_id for p in blocked]
+            raise error
 
         return responses
+
+    @staticmethod
+    def _logout_responses(coordinator):
+        """Build the legacy response dict from a coordinator's current state."""
+        responses = {}
+        for participant in coordinator.state.participants.values():
+            if participant.state == "succeeded":
+                responses[participant.entity_id] = participant.response
+            elif participant.state == "in_progress":
+                responses[participant.entity_id] = (participant.binding, participant.http_info)
+            # unsupported / failed / timed_out participants are simply absent
+        return responses
+
+    def retry_logout(self, name_id, entity_ids=None, expected_binding=None):
+        """Retry single logout for participants that never finished.
+
+        Successfully logged out participants are not touched and their
+        sessions are not restored.
+
+        :return: the same response dict shape as :meth:`do_logout`.
+        """
+        coordinator = SingleLogoutCoordinator.resume(self, name_id)
+        coordinator.retry(entity_ids=entity_ids, expected_binding=expected_binding)
+        return self._logout_responses(coordinator)
 
     def local_logout(self, name_id):
         """Remove the user from the cache, equals local logout
@@ -404,10 +376,34 @@ class Saml2Client(Base):
         """
 
         logger.debug("state: %s", self.state)
-        status = self.state[response.in_response_to]
+        status = self.state.get(response.in_response_to)
         logger.debug("status: %s", status)
         issuer = response.issuer()
         logger.debug("issuer: %s", issuer)
+
+        if status is None:
+            # No outstanding request with this id: the local SP session has
+            # already been cleaned, so the response cannot advance any state.
+            raise LocalSessionCleaned(
+                f"Received LogoutResponse for unknown request {response.in_response_to}; "
+                "local session has been cleaned"
+            )
+
+        # Stateful SLO path: validate request id + issuer + local session
+        # against the coordinator, which keeps every participant's result.
+        slo_state_key = status.get("slo_state_key")
+        if slo_state_key and slo_state_key in self.slo_states:
+            logout_state = self.slo_states[slo_state_key]
+            coordinator = SingleLogoutCoordinator(self, logout_state.name_id, state=logout_state)
+            coordinator.process_response(response)
+            if logout_state.is_complete():
+                return 0, "200 Ok", [("Content-type", "text/html")], []
+            # Continue the chain for the still unfinished participants,
+            # reusing the same coordinator so no result is lost.
+            coordinator.retry()
+            return self._logout_responses(coordinator)
+
+        # Legacy path for state entries created without a coordinator.
         del self.state[response.in_response_to]
         if status["entity_ids"] == [issuer]:  # done
             self.local_logout(decode(status["name_id"]))

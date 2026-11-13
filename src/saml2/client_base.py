@@ -158,6 +158,8 @@ class Base(Entity):
             self.state = {}  # in memory storage
         else:
             self.state = state_cache
+        # stateful single logout operations, keyed by coded NameID
+        self.slo_states = {}
 
         attribute_defaults = {
             "logout_requests_signed": False,
